@@ -1,0 +1,503 @@
+#!/bin/bash
+set -euo pipefail
+
+# ----------------------------
+# On my honor, as an Aggie, I have neither given nor received unauthorized assistance on this assignment.
+# I further affirm that I have not and will not provide this code to any person, platform, or repository,
+# without the express written permission of Dr. Gomillion.
+# I understand that any violation of these standards will have serious repercussions.
+# ----------------------------
+
+exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+
+touch /root/1-script-started
+
+# ----------------------------
+# Progress Logging
+# ----------------------------
+
+ProgressLog="/var/log/user-data-progress.log"
+touch "$ProgressLog"
+chmod 644 "$ProgressLog"
+
+TotalSteps=8
+CurrentStep=0
+
+NextStep() {
+  CurrentStep=$((CurrentStep+1))
+  Percent=$((CurrentStep*100/TotalSteps))
+  {
+    echo ""
+    echo "=================================================="
+    echo "STEP $CurrentStep of $TotalSteps  [$Percent%]"
+    echo "$1"
+    echo "=================================================="
+  } | tee -a "$ProgressLog"
+}
+
+LogStatus() {
+  echo "Status: $1" | tee -a "$ProgressLog"
+}
+
+# ----------------------------
+# watchud utility
+# ----------------------------
+
+cat > /usr/local/bin/watchud <<'EOF'
+#!/bin/bash
+exec /usr/local/bin/watch-userdata-progress
+EOF
+chmod 755 /usr/local/bin/watchud
+
+cat > /usr/local/bin/watch-userdata-progress <<'EOF'
+#!/bin/bash
+ProgressLog="/var/log/user-data-progress.log"
+[ ! -f "$ProgressLog" ] && echo "Progress log not found" && exit 1
+echo "Watching EC2 user-data progress (Ctrl+C to stop)"
+tail -n 20 "$ProgressLog"
+tail -f "$ProgressLog"
+EOF
+chmod 755 /usr/local/bin/watch-userdata-progress
+
+if [ -f /home/ubuntu/.bashrc ] && ! grep -q "alias watchud=" /home/ubuntu/.bashrc 2>/dev/null; then
+  echo "" >> /home/ubuntu/.bashrc
+  echo "alias watchud='/usr/local/bin/watchud'" >> /home/ubuntu/.bashrc
+fi
+
+# ----------------------------
+# STEP 1: System prep
+# ----------------------------
+
+NextStep "System preparation and package updates"
+LogStatus "Updating packages"
+apt update
+apt upgrade -y
+apt install apt-transport-https curl unzip wget -y
+LogStatus "Prerequisites installed"
+
+# ----------------------------
+# STEP 2: Install MariaDB 11.8
+# ----------------------------
+
+NextStep "Installing MariaDB 11.8"
+LogStatus "Adding MariaDB repo"
+mkdir -p /etc/apt/keyrings
+curl -o /etc/apt/keyrings/mariadb-keyring.pgp 'https://mariadb.org/mariadb_release_signing_key.pgp'
+
+cat > /etc/apt/sources.list.d/mariadb.sources <<'EOF'
+X-Repolib-Name: MariaDB
+Types: deb
+URIs: https://mirrors.accretive-networks.net/mariadb/repo/11.8/ubuntu
+Suites: noble
+Components: main main/debug
+Signed-By: /etc/apt/keyrings/mariadb-keyring.pgp
+EOF
+
+apt update
+apt install mariadb-server -y
+systemctl enable mariadb
+systemctl start mariadb
+touch /root/3-mariadb-installed
+LogStatus "MariaDB installed and running"
+
+# ----------------------------
+# STEP 3: Configure MariaDB for PRIMARY role
+# ----------------------------
+
+NextStep "Configuring MariaDB as PRIMARY (server-id=1)"
+LogStatus "Writing replication config"
+
+# Find the config file
+CNFFILE=""
+for f in /etc/mysql/mariadb.conf.d/50-server.cnf \
+          /etc/mysql/my.cnf \
+          /etc/my.cnf; do
+  [ -f "$f" ] && CNFFILE="$f" && break
+done
+
+if [ -z "$CNFFILE" ]; then
+  echo "ERROR: Could not find MariaDB config file"
+  exit 1
+fi
+
+# Comment out skip-networking if present
+sed -i 's/^skip-networking/#skip-networking/' "$CNFFILE"
+
+# Set bind-address to 0.0.0.0 (accept connections from replicas)
+if grep -q "^bind-address" "$CNFFILE"; then
+  sed -i 's/^bind-address.*/bind-address = 0.0.0.0/' "$CNFFILE"
+else
+  echo "bind-address = 0.0.0.0" >> "$CNFFILE"
+fi
+
+# Set server-id = 1 (unique to Primary)
+if grep -q "^server-id" "$CNFFILE"; then
+  sed -i 's/^server-id.*/server-id = 1/' "$CNFFILE"
+else
+  echo "server-id = 1" >> "$CNFFILE"
+fi
+
+# Enable binary logging (required for replication)
+if ! grep -q "^log_bin" "$CNFFILE"; then
+  echo "log_bin = /var/log/mysql/mysql-bin.log" >> "$CNFFILE"
+fi
+
+# Set binlog format to mixed per Dr. Gomillion's instruction.
+# Mixed format ensures DDL statements (CREATE TABLE, ALTER TABLE etc.)
+# replicate correctly to the replicas, which ROW-only format may not handle.
+if ! grep -q "^binlog_format" "$CNFFILE"; then
+  echo "binlog_format = mixed" >> "$CNFFILE"
+fi
+
+# FIX: Allow trigger creation by non-SUPER users when binary logging is enabled.
+# Without this, running views.sql as any unprivileged user fails with ERROR 1419.
+# This is safe in a controlled academic environment.
+if ! grep -q "^log_bin_trust_function_creators" "$CNFFILE"; then
+  echo "log_bin_trust_function_creators = 1" >> "$CNFFILE"
+fi
+
+LogStatus "Restarting MariaDB with new config"
+systemctl restart mariadb
+
+systemctl is-active --quiet mariadb || { echo "ERROR: MariaDB failed to restart"; exit 1; }
+LogStatus "Primary MariaDB config applied"
+
+# ----------------------------
+# STEP 4: Create Linux user mbennett
+# ----------------------------
+
+NextStep "Creating unprivileged Linux user (mbennett)"
+if id "mbennett" &>/dev/null; then
+  echo "Linux user mbennett already exists"
+else
+  useradd -m -s /bin/bash "mbennett"
+  echo "Created Linux user mbennett"
+fi
+LogStatus "Linux user ready"
+
+# ----------------------------
+# STEP 5: Download and unzip data
+# ----------------------------
+
+NextStep "Downloading and unzipping source data"
+LogStatus "Downloading dataset"
+sudo -u "mbennett" wget -O "/home/mbennett/313007119.zip" "https://622.gomillion.org/data/313007119.zip"
+
+if [ ! -s "/home/mbennett/313007119.zip" ]; then
+  echo "ERROR: Download failed or zip is empty"
+  exit 1
+fi
+
+sudo -u "mbennett" unzip -o "/home/mbennett/313007119.zip" -d "/home/mbennett"
+
+for f in customers.csv orders.csv orderlines.csv products.csv; do
+  [ ! -f "/home/mbennett/$f" ] && echo "ERROR: Missing $f after unzip" && exit 1
+done
+LogStatus "Data files verified"
+
+# ----------------------------
+# STEP 6: Generate etl.sql
+# ----------------------------
+
+NextStep "Generating etl.sql"
+LogStatus "Writing etl.sql"
+
+cat > "/home/mbennett/etl.sql" <<'ETLEOF'
+DROP DATABASE IF EXISTS POS;
+CREATE DATABASE POS;
+USE POS;
+
+CREATE TABLE City
+(
+  zip   DECIMAL(5) ZEROFILL NOT NULL,
+  city  VARCHAR(32)         NOT NULL,
+  state VARCHAR(4)          NOT NULL,
+  PRIMARY KEY (zip)
+) ENGINE=InnoDB;
+
+CREATE TABLE Customer
+(
+  id        SERIAL       NOT NULL,
+  firstName VARCHAR(32)  NOT NULL,
+  lastName  VARCHAR(30)  NOT NULL,
+  email     VARCHAR(128) NULL,
+  address1  VARCHAR(100) NULL,
+  address2  VARCHAR(50)  NULL,
+  phone     VARCHAR(32)  NULL,
+  birthdate DATE         NULL,
+  zip       DECIMAL(5) ZEROFILL NOT NULL,
+  PRIMARY KEY (id),
+  CONSTRAINT fk_customer_city
+    FOREIGN KEY (zip) REFERENCES City(zip)
+) ENGINE=InnoDB;
+
+CREATE TABLE Product
+(
+  id                SERIAL         NOT NULL,
+  name              VARCHAR(128)   NOT NULL,
+  currentPrice      DECIMAL(6,2)   NOT NULL,
+  availableQuantity INT            NOT NULL,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB;
+
+CREATE TABLE `Order`
+(
+  id          SERIAL       NOT NULL,
+  datePlaced  DATE         NULL,
+  dateShipped DATE         NULL,
+  customer_id BIGINT UNSIGNED NOT NULL,
+  PRIMARY KEY (id),
+  CONSTRAINT fk_order_customer
+    FOREIGN KEY (customer_id) REFERENCES Customer(id)
+) ENGINE=InnoDB;
+
+CREATE TABLE Orderline
+(
+  order_id   BIGINT UNSIGNED NOT NULL,
+  product_id BIGINT UNSIGNED NOT NULL,
+  quantity   INT             NOT NULL,
+  PRIMARY KEY (order_id, product_id),
+  CONSTRAINT fk_orderline_order
+    FOREIGN KEY (order_id) REFERENCES `Order`(id),
+  CONSTRAINT fk_orderline_product
+    FOREIGN KEY (product_id) REFERENCES Product(id)
+) ENGINE=InnoDB;
+
+CREATE TABLE PriceHistory
+(
+  id         SERIAL       NOT NULL,
+  oldPrice   DECIMAL(6,2) NULL,
+  newPrice   DECIMAL(6,2) NOT NULL,
+  ts         TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  product_id BIGINT UNSIGNED NOT NULL,
+  PRIMARY KEY (id),
+  CONSTRAINT fk_pricehistory_product
+    FOREIGN KEY (product_id) REFERENCES Product(id)
+) ENGINE=InnoDB;
+
+CREATE TABLE staging_customer
+(
+  ID VARCHAR(50), FN VARCHAR(255), LN VARCHAR(255),
+  CT VARCHAR(255), ST VARCHAR(255), ZP VARCHAR(50),
+  S1 VARCHAR(255), S2 VARCHAR(255), EM VARCHAR(255), BD VARCHAR(50)
+) ENGINE=InnoDB;
+
+CREATE TABLE staging_orders
+(
+  OID VARCHAR(50), CID VARCHAR(50), Ordered VARCHAR(50), Shipped VARCHAR(50)
+) ENGINE=InnoDB;
+
+CREATE TABLE staging_orderlines
+(
+  OID VARCHAR(50), PID VARCHAR(50)
+) ENGINE=InnoDB;
+
+CREATE TABLE staging_products
+(
+  ID VARCHAR(50), Name VARCHAR(255), Price VARCHAR(50), Quantity_on_Hand VARCHAR(50)
+) ENGINE=InnoDB;
+
+LOAD DATA LOCAL INFILE '/home/mbennett/customers.csv'
+INTO TABLE staging_customer
+FIELDS TERMINATED BY ','
+OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 LINES;
+
+LOAD DATA LOCAL INFILE '/home/mbennett/orders.csv'
+INTO TABLE staging_orders
+FIELDS TERMINATED BY ','
+OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 LINES;
+
+LOAD DATA LOCAL INFILE '/home/mbennett/orderlines.csv'
+INTO TABLE staging_orderlines
+FIELDS TERMINATED BY ','
+OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 LINES;
+
+LOAD DATA LOCAL INFILE '/home/mbennett/products.csv'
+INTO TABLE staging_products
+FIELDS TERMINATED BY ','
+OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 LINES
+(@ID, @Name, @Price, @QOH)
+SET ID=@ID, Name=@Name, Price=@Price, Quantity_on_Hand=@QOH;
+
+INSERT INTO City (zip, city, state)
+SELECT DISTINCT
+  CAST(LPAD(NULLIF(ZP,''), 5, '0') AS UNSIGNED),
+  CT, ST
+FROM staging_customer
+WHERE NULLIF(ZP,'') IS NOT NULL;
+
+INSERT INTO Customer (id, firstName, lastName, email, address1, address2, phone, birthdate, zip)
+SELECT
+  CAST(ID AS UNSIGNED), FN, LN, NULLIF(EM,''), NULLIF(S1,''), NULLIF(S2,''),
+  NULL, STR_TO_DATE(NULLIF(BD,''), '%m/%d/%Y'),
+  CAST(LPAD(NULLIF(ZP,''), 5, '0') AS UNSIGNED)
+FROM staging_customer;
+
+INSERT INTO Product (id, name, currentPrice, availableQuantity)
+SELECT
+  CAST(ID AS UNSIGNED), Name,
+  CAST(REPLACE(REPLACE(NULLIF(Price,''), '$', ''), ',', '') AS DECIMAL(6,2)),
+  CAST(NULLIF(Quantity_on_Hand,'') AS UNSIGNED)
+FROM staging_products;
+
+INSERT INTO `Order` (id, datePlaced, dateShipped, customer_id)
+SELECT
+  CAST(OID AS UNSIGNED),
+  CASE WHEN NULLIF(Ordered,'') IS NULL OR LOWER(Ordered)='cancelled' THEN NULL
+       ELSE DATE(STR_TO_DATE(Ordered, '%Y-%m-%d %H:%i:%s')) END,
+  CASE WHEN NULLIF(Shipped,'') IS NULL OR LOWER(Shipped)='cancelled' THEN NULL
+       ELSE DATE(STR_TO_DATE(Shipped, '%Y-%m-%d %H:%i:%s')) END,
+  CAST(CID AS UNSIGNED)
+FROM staging_orders;
+
+INSERT INTO Orderline (order_id, product_id, quantity)
+SELECT CAST(OID AS UNSIGNED), CAST(PID AS UNSIGNED), COUNT(*)
+FROM staging_orderlines
+GROUP BY CAST(OID AS UNSIGNED), CAST(PID AS UNSIGNED);
+
+INSERT INTO PriceHistory (oldPrice, newPrice, product_id)
+SELECT NULL, currentPrice, id FROM Product;
+
+DROP TABLE staging_customer;
+DROP TABLE staging_orders;
+DROP TABLE staging_orderlines;
+DROP TABLE staging_products;
+ETLEOF
+
+chown "mbennett:mbennett" "/home/mbennett/etl.sql"
+LogStatus "etl.sql generated"
+
+# ----------------------------
+# STEP 7: Generate views.sql
+# FIX: DELIMITER does not work when piping SQL via redirection (< file).
+# Triggers are instead created via mariadb heredoc calls at Phase 2 time,
+# but we still write views.sql here for the view and materialized view portion.
+# Triggers are written to a separate triggers.sql file executed via heredoc.
+# ----------------------------
+
+NextStep "Generating views.sql and triggers.sql"
+LogStatus "Writing views.sql"
+
+cat > "/home/mbennett/views.sql" <<'VIEWEOF'
+USE POS;
+
+DROP VIEW IF EXISTS v_ProductBuyers;
+
+CREATE VIEW v_ProductBuyers AS
+SELECT
+    p.id AS productID,
+    p.name AS productName,
+    IFNULL(
+        GROUP_CONCAT(
+            DISTINCT CONCAT(c.id, ' ', c.firstName, ' ', c.lastName)
+            ORDER BY c.id
+            SEPARATOR ', '
+        ),
+        ''
+    ) AS customers
+FROM Product p
+LEFT JOIN Orderline ol ON p.id = ol.product_id
+LEFT JOIN `Order` o ON ol.order_id = o.id
+LEFT JOIN Customer c ON o.customer_id = c.id
+GROUP BY p.id, p.name
+ORDER BY p.id;
+
+DROP TABLE IF EXISTS mv_ProductBuyers;
+
+CREATE TABLE mv_ProductBuyers AS
+SELECT * FROM v_ProductBuyers;
+
+CREATE INDEX idx_mv_productID ON mv_ProductBuyers(productID);
+VIEWEOF
+
+chown "mbennett:mbennett" "/home/mbennett/views.sql"
+LogStatus "views.sql generated"
+
+# FIX: Triggers use DELIMITER which is a client-only directive and breaks
+# when SQL is piped via stdin redirection. Write triggers.sql to be executed
+# via mariadb heredoc in Phase 2 (manual-steps.sh), which handles multi-statement
+# blocks correctly without needing DELIMITER.
+
+cat > "/home/mbennett/triggers.sql" <<'TRIGEOF'
+USE POS;
+
+DROP TRIGGER IF EXISTS trg_orderline_insert;
+DROP TRIGGER IF EXISTS trg_orderline_delete;
+DROP TRIGGER IF EXISTS trg_product_price_update;
+
+CREATE TRIGGER trg_orderline_insert
+AFTER INSERT ON Orderline
+FOR EACH ROW
+UPDATE mv_ProductBuyers
+SET customers = (
+    SELECT IFNULL(
+        GROUP_CONCAT(
+            DISTINCT CONCAT(c.id, ' ', c.firstName, ' ', c.lastName)
+            ORDER BY c.id SEPARATOR ', '
+        ), '')
+    FROM Orderline ol
+    JOIN `Order` o ON ol.order_id = o.id
+    JOIN Customer c ON o.customer_id = c.id
+    WHERE ol.product_id = NEW.product_id
+)
+WHERE productID = NEW.product_id;
+
+CREATE TRIGGER trg_orderline_delete
+AFTER DELETE ON Orderline
+FOR EACH ROW
+UPDATE mv_ProductBuyers
+SET customers = (
+    SELECT IFNULL(
+        GROUP_CONCAT(
+            DISTINCT CONCAT(c.id, ' ', c.firstName, ' ', c.lastName)
+            ORDER BY c.id SEPARATOR ', '
+        ), '')
+    FROM Orderline ol
+    JOIN `Order` o ON ol.order_id = o.id
+    JOIN Customer c ON o.customer_id = c.id
+    WHERE ol.product_id = OLD.product_id
+)
+WHERE productID = OLD.product_id;
+
+CREATE TRIGGER trg_product_price_update
+AFTER UPDATE ON Product
+FOR EACH ROW
+INSERT INTO PriceHistory (oldPrice, newPrice, product_id)
+SELECT OLD.currentPrice, NEW.currentPrice, NEW.id
+WHERE OLD.currentPrice <> NEW.currentPrice;
+TRIGEOF
+
+chown "mbennett:mbennett" "/home/mbennett/triggers.sql"
+LogStatus "triggers.sql generated"
+
+# ----------------------------
+# STEP 8: Done — waiting for manual replication setup
+# ----------------------------
+
+NextStep "Bootstrap complete — awaiting Phase 2 manual replication setup"
+echo ""
+echo "============================================================"
+echo "  PRIMARY bootstrap complete."
+echo "  DO NOT run etl.sql yet."
+echo "  Complete Phase 2 manual steps (see manual-steps.sh):"
+echo "    1. Create the replication user on this server"
+echo "    2. Run CHANGE MASTER TO on both replicas"
+echo "    3. START SLAVE on both replicas"
+echo "    4. Verify SHOW SLAVE STATUS shows Yes/Yes on both"
+echo "    5. Run etl.sql on this server (as root)"
+echo "    6. Create mbennett DB user and grant POS.* privileges"
+echo "    7. Run views.sql then triggers.sql on this server (as root)"
+echo "============================================================"
+touch /root/primary-bootstrap-complete
+LogStatus "Primary bootstrap complete - awaiting Phase 2"
