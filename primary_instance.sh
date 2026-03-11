@@ -16,7 +16,7 @@ export NEEDRESTART_MODE=a
 touch /root/1-script-started
 
 # ----------------------------
-# Progress Logging
+# Progress Logging (clean STEP banners + status lines only)
 # ----------------------------
 
 ProgressLog="/var/log/user-data-progress.log"
@@ -43,7 +43,184 @@ LogStatus() {
 }
 
 # ----------------------------
-# watchud utility
+# SSH Watcher: smooth ASCII bar + STEP X/8 + label + spinner (no blinking)
+# Usage after SSH: watchud
+# Auto-exits at STEP 8 with 10s countdown
+# ----------------------------
+
+cat > /usr/local/bin/watch-userdata-progress <<'EOF'
+#!/bin/bash
+set -u
+
+ProgressLog="/var/log/user-data-progress.log"
+TotalBarWidth=24
+RefreshSeconds=0.5
+
+if [ ! -f "$ProgressLog" ]; then
+  echo "Progress log not found: $ProgressLog"
+  exit 1
+fi
+
+# Colors only when output is a real terminal
+if [ -t 1 ]; then
+  C_RESET=$'\033[0m'
+  C_DIM=$'\033[2m'
+  C_BOLD=$'\033[1m'
+  C_CYAN=$'\033[36m'
+  C_YELLOW=$'\033[33m'
+  C_GREEN=$'\033[32m'
+else
+  C_RESET=""
+  C_DIM=""
+  C_BOLD=""
+  C_CYAN=""
+  C_YELLOW=""
+  C_GREEN=""
+fi
+
+Cols=$(tput cols 2>/dev/null || echo 120)
+
+DrawBar() {
+  local Percent="$1"
+  local Filled=$((Percent * TotalBarWidth / 100))
+  local Empty=$((TotalBarWidth - Filled))
+
+  printf "["
+  if [ "$Filled" -gt 0 ]; then
+    printf "%s" "${C_CYAN}"
+    printf "%0.s#" $(seq 1 "$Filled")
+    printf "%s" "${C_RESET}"
+  fi
+  if [ "$Empty" -gt 0 ]; then
+    printf "%s" "${C_DIM}"
+    printf "%0.s-" $(seq 1 "$Empty")
+    printf "%s" "${C_RESET}"
+  fi
+  printf "] %s%%" "$Percent"
+}
+
+GetLatestStepLine() {
+  grep -E "STEP [0-9]+ of [0-9]+  \[[0-9]+%\]" "$ProgressLog" 2>/dev/null | tail -n 1 || true
+}
+
+GetLatestPercent() {
+  local line
+  line="$(GetLatestStepLine)"
+  if [ -n "$line" ]; then
+    echo "$line" | sed -n 's/.*\[\([0-9]\+\)%\].*/\1/p'
+  else
+    echo "0"
+  fi
+}
+
+GetLatestStepNumbers() {
+  local line
+  line="$(GetLatestStepLine)"
+  if [ -n "$line" ]; then
+    echo "$line" | sed -n 's/STEP \([0-9]\+\) of \([0-9]\+\).*/\1 \2/p'
+  else
+    echo "0 0"
+  fi
+}
+
+GetLatestLabel() {
+  awk '/STEP [0-9]+ of [0-9]+  \[[0-9]+%\]/{getline; print}' "$ProgressLog" 2>/dev/null | tail -n 1 || true
+}
+
+RenderLine() {
+  local Percent="$1"
+  local StepNow="$2"
+  local StepTotal="$3"
+  local Label="$4"
+  local Frame="$5"
+
+  local Bar StepText Text
+  Bar="$(DrawBar "$Percent")"
+
+  if [ "${StepTotal:-0}" -gt 0 ]; then
+    StepText="${C_GREEN}STEP ${StepNow}/${StepTotal}${C_RESET}"
+  else
+    StepText=""
+  fi
+
+  Text="${C_BOLD}Deploying${C_RESET} ${Bar}  ${StepText}  ${C_YELLOW}${Label}${C_RESET}  ${Frame}"
+
+  # Print one line, padded to terminal width to overwrite previous content (no flicker)
+  printf "\r%-*s" "$Cols" "$Text"
+}
+
+echo ""
+echo "${C_BOLD}Watching EC2 user-data progress${C_RESET} (Ctrl+C to stop)"
+echo ""
+
+# Show some context
+tail -n 20 "$ProgressLog" 2>/dev/null || true
+
+LastLineCount=$(wc -l < "$ProgressLog" 2>/dev/null || echo 0)
+
+TargetPercent="$(GetLatestPercent)"
+ShownPercent="$TargetPercent"
+read -r StepNow StepTotal <<<"$(GetLatestStepNumbers)"
+CurrentLabel="$(GetLatestLabel)"
+[ -z "${CurrentLabel:-}" ] && CurrentLabel="Starting..."
+
+i=0
+frames='|/-\'
+
+while true; do
+  CurrentLineCount=$(wc -l < "$ProgressLog" 2>/dev/null || echo "$LastLineCount")
+
+  # Print any newly appended lines
+  if [ "$CurrentLineCount" -gt "$LastLineCount" ]; then
+    # Move off the dashboard line cleanly
+    printf "\r%-*s\n" "$Cols" " "
+    sed -n "$((LastLineCount+1)),${CurrentLineCount}p" "$ProgressLog" 2>/dev/null || true
+    LastLineCount="$CurrentLineCount"
+  fi
+
+  # Update targets from log
+  NewTarget="$(GetLatestPercent)"
+  [ -n "${NewTarget:-}" ] && TargetPercent="$NewTarget"
+
+  read -r NewStepNow NewStepTotal <<<"$(GetLatestStepNumbers)"
+  [ -n "${NewStepNow:-}" ] && StepNow="$NewStepNow"
+  [ -n "${NewStepTotal:-}" ] && StepTotal="$NewStepTotal"
+
+  NewLabel="$(GetLatestLabel)"
+  [ -n "${NewLabel:-}" ] && CurrentLabel="$NewLabel"
+
+  # Smooth-fill toward the target
+  if [ "$ShownPercent" -lt "$TargetPercent" ]; then
+    ShownPercent=$((ShownPercent+1))
+  elif [ "$ShownPercent" -gt "$TargetPercent" ]; then
+    ShownPercent="$TargetPercent"
+  fi
+
+  # Completion check — STEP 8 of 8
+  if tail -n 50 "$ProgressLog" 2>/dev/null | grep -q "STEP 8 of 8"; then
+    RenderLine 100 8 8 "$CurrentLabel" ""
+    printf "\n\n${C_GREEN}Bootstrap complete — PRIMARY is ready for Phase 2.${C_RESET}\nReturning to prompt in 10 seconds...\n"
+    for count in 10 9 8 7 6 5 4 3 2 1; do
+      printf "\r  Closing in %s second(s)...  " "$count"
+      sleep 1
+    done
+    printf "\r%-*s\n" "$Cols" " "
+    echo "Done."
+    exit 0
+  fi
+
+  frame="${frames:i%4:1}"
+  RenderLine "$ShownPercent" "$StepNow" "$StepTotal" "$CurrentLabel" "$frame"
+
+  i=$((i+1))
+  sleep "$RefreshSeconds"
+done
+EOF
+
+chmod 755 /usr/local/bin/watch-userdata-progress
+
+# ----------------------------
+# Create watchud command
 # ----------------------------
 
 cat > /usr/local/bin/watchud <<'EOF'
@@ -52,29 +229,21 @@ exec /usr/local/bin/watch-userdata-progress
 EOF
 chmod 755 /usr/local/bin/watchud
 
-cat > /usr/local/bin/watch-userdata-progress <<'EOF'
-#!/bin/bash
-ProgressLog="/var/log/user-data-progress.log"
-[ ! -f "$ProgressLog" ] && echo "Progress log not found" && exit 1
-echo "Watching EC2 user-data progress (Ctrl+C to stop)"
-tail -n 20 "$ProgressLog"
-tail -f "$ProgressLog"
-EOF
-chmod 755 /usr/local/bin/watch-userdata-progress
-
 if [ -f /home/ubuntu/.bashrc ] && ! grep -q "alias watchud=" /home/ubuntu/.bashrc 2>/dev/null; then
   echo "" >> /home/ubuntu/.bashrc
   echo "alias watchud='/usr/local/bin/watchud'" >> /home/ubuntu/.bashrc
 fi
+chown ubuntu:ubuntu /home/ubuntu/.bashrc 2>/dev/null || true
 
 # ----------------------------
 # STEP 1: System prep
 # ----------------------------
 
 NextStep "System preparation and package updates"
-LogStatus "Updating packages"
+LogStatus "Updating packages (apt update/upgrade)"
 apt update
 apt upgrade -y
+LogStatus "Installing prerequisites (curl, unzip, wget)"
 apt install apt-transport-https curl unzip wget -y
 LogStatus "Prerequisites installed"
 
@@ -83,7 +252,7 @@ LogStatus "Prerequisites installed"
 # ----------------------------
 
 NextStep "Installing MariaDB 11.8"
-LogStatus "Adding MariaDB repo"
+LogStatus "Adding MariaDB repo key and sources"
 mkdir -p /etc/apt/keyrings
 curl -o /etc/apt/keyrings/mariadb-keyring.pgp 'https://mariadb.org/mariadb_release_signing_key.pgp'
 
@@ -96,21 +265,25 @@ Components: main main/debug
 Signed-By: /etc/apt/keyrings/mariadb-keyring.pgp
 EOF
 
+LogStatus "Installing MariaDB server"
 apt update
 apt install mariadb-server -y
+
+LogStatus "Enabling and starting MariaDB service"
 systemctl enable mariadb
 systemctl start mariadb
 touch /root/3-mariadb-installed
-LogStatus "MariaDB installed and running"
+
+systemctl is-active --quiet mariadb || { echo "ERROR: MariaDB did not start"; exit 1; }
+LogStatus "MariaDB is running"
 
 # ----------------------------
 # STEP 3: Configure MariaDB for PRIMARY role
 # ----------------------------
 
 NextStep "Configuring MariaDB as PRIMARY (server-id=1)"
-LogStatus "Writing replication config"
+LogStatus "Locating MariaDB config file"
 
-# Find the config file
 CNFFILE=""
 for f in /etc/mysql/mariadb.conf.d/50-server.cnf \
           /etc/mysql/my.cnf \
@@ -122,6 +295,8 @@ if [ -z "$CNFFILE" ]; then
   echo "ERROR: Could not find MariaDB config file"
   exit 1
 fi
+
+LogStatus "Applying PRIMARY config to $CNFFILE"
 
 # Comment out skip-networking if present
 sed -i 's/^skip-networking/#skip-networking/' "$CNFFILE"
@@ -145,45 +320,43 @@ if ! grep -q "^log_bin" "$CNFFILE"; then
   echo "log_bin = /var/log/mysql/mysql-bin.log" >> "$CNFFILE"
 fi
 
-# Set binlog format to mixed per Dr. Gomillion's instruction.
-# Mixed format ensures DDL statements (CREATE TABLE, ALTER TABLE etc.)
-# replicate correctly to the replicas, which ROW-only format may not handle.
+# Set binlog format to MIXED per Dr. Gomillion's instruction
+# Mixed handles both DDL (statement-based) and DML (row-based) correctly
 if ! grep -q "^binlog_format" "$CNFFILE"; then
   echo "binlog_format = mixed" >> "$CNFFILE"
 fi
 
-# FIX: Allow trigger creation by non-SUPER users when binary logging is enabled.
-# Without this, running views.sql as any unprivileged user fails with ERROR 1419.
-# This is safe in a controlled academic environment.
+# Allow trigger/function creation when binary logging is enabled
+# Without this, any non-SUPER user gets ERROR 1419 on CREATE TRIGGER
 if ! grep -q "^log_bin_trust_function_creators" "$CNFFILE"; then
   echo "log_bin_trust_function_creators = 1" >> "$CNFFILE"
 fi
 
-LogStatus "Restarting MariaDB with new config"
+LogStatus "Restarting MariaDB with PRIMARY config"
 systemctl restart mariadb
-
 systemctl is-active --quiet mariadb || { echo "ERROR: MariaDB failed to restart"; exit 1; }
-LogStatus "Primary MariaDB config applied"
+LogStatus "PRIMARY config applied (server-id=1, bin-log enabled, read-write)"
 
 # ----------------------------
 # STEP 4: Create Linux user mbennett
 # ----------------------------
 
 NextStep "Creating unprivileged Linux user (mbennett)"
+LogStatus "Creating Linux user (mbennett)"
 if id "mbennett" &>/dev/null; then
   echo "Linux user mbennett already exists"
 else
   useradd -m -s /bin/bash "mbennett"
   echo "Created Linux user mbennett"
 fi
-LogStatus "Linux user ready"
+LogStatus "Linux user step completed"
 
 # ----------------------------
 # STEP 5: Download and unzip data
 # ----------------------------
 
 NextStep "Downloading and unzipping source data"
-LogStatus "Downloading dataset"
+LogStatus "Downloading dataset zip"
 sudo -u "mbennett" wget -O "/home/mbennett/313007119.zip" "https://622.gomillion.org/data/313007119.zip"
 
 if [ ! -s "/home/mbennett/313007119.zip" ]; then
@@ -191,19 +364,20 @@ if [ ! -s "/home/mbennett/313007119.zip" ]; then
   exit 1
 fi
 
+LogStatus "Unzipping dataset"
 sudo -u "mbennett" unzip -o "/home/mbennett/313007119.zip" -d "/home/mbennett"
 
 for f in customers.csv orders.csv orderlines.csv products.csv; do
   [ ! -f "/home/mbennett/$f" ] && echo "ERROR: Missing $f after unzip" && exit 1
 done
-LogStatus "Data files verified"
+LogStatus "Dataset downloaded and verified"
 
 # ----------------------------
 # STEP 6: Generate etl.sql
 # ----------------------------
 
 NextStep "Generating etl.sql"
-LogStatus "Writing etl.sql"
+LogStatus "Writing etl.sql to disk"
 
 cat > "/home/mbennett/etl.sql" <<'ETLEOF'
 DROP DATABASE IF EXISTS POS;
@@ -379,15 +553,15 @@ chown "mbennett:mbennett" "/home/mbennett/etl.sql"
 LogStatus "etl.sql generated"
 
 # ----------------------------
-# STEP 7: Generate views.sql
-# FIX: DELIMITER does not work when piping SQL via redirection (< file).
-# Triggers are instead created via mariadb heredoc calls at Phase 2 time,
-# but we still write views.sql here for the view and materialized view portion.
-# Triggers are written to a separate triggers.sql file executed via heredoc.
+# STEP 7: Generate views.sql and triggers.sql
+# NOTE: DELIMITER is a client-only directive and silently breaks when SQL is
+# piped via stdin redirection (< file). Triggers are written as single-statement
+# form (no BEGIN...END block needed for single-statement triggers) which works
+# correctly without DELIMITER in both batch and interactive modes.
 # ----------------------------
 
 NextStep "Generating views.sql and triggers.sql"
-LogStatus "Writing views.sql"
+LogStatus "Writing views.sql to disk"
 
 cat > "/home/mbennett/views.sql" <<'VIEWEOF'
 USE POS;
@@ -424,10 +598,7 @@ VIEWEOF
 chown "mbennett:mbennett" "/home/mbennett/views.sql"
 LogStatus "views.sql generated"
 
-# FIX: Triggers use DELIMITER which is a client-only directive and breaks
-# when SQL is piped via stdin redirection. Write triggers.sql to be executed
-# via mariadb heredoc in Phase 2 (manual-steps.sh), which handles multi-statement
-# blocks correctly without needing DELIMITER.
+LogStatus "Writing triggers.sql to disk"
 
 cat > "/home/mbennett/triggers.sql" <<'TRIGEOF'
 USE POS;
@@ -482,7 +653,7 @@ chown "mbennett:mbennett" "/home/mbennett/triggers.sql"
 LogStatus "triggers.sql generated"
 
 # ----------------------------
-# STEP 8: Done — waiting for manual replication setup
+# STEP 8: Bootstrap complete
 # ----------------------------
 
 NextStep "Bootstrap complete — awaiting Phase 2 manual replication setup"
@@ -490,7 +661,7 @@ echo ""
 echo "============================================================"
 echo "  PRIMARY bootstrap complete."
 echo "  DO NOT run etl.sql yet."
-echo "  Complete Phase 2 manual steps (see manual-steps.sh):"
+echo "  Complete Phase 2 manual steps:"
 echo "    1. Create the replication user on this server"
 echo "    2. Run CHANGE MASTER TO on both replicas"
 echo "    3. START SLAVE on both replicas"
