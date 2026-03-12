@@ -1,0 +1,540 @@
+#!/bin/bash
+set -euo pipefail
+
+# ----------------------------
+# On my honor, as an Aggie, I have neither given nor received unauthorized assistance on this assignment.
+# I further affirm that I have not and will not provide this code to any person, platform, or repository,
+# without the express written permission of Dr. Gomillion.
+# I understand that any violation of these standards will have serious repercussions.
+# ----------------------------
+
+# ----------------------------
+# REPLICA CONFIGURATION
+# SERVER_ID must be unique across the entire cluster.
+# Primary = 1, Replica 1 = 2, Replica 2 = 3
+# ----------------------------
+SERVER_ID=3
+
+exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+
+touch /root/1-script-started
+
+# ----------------------------
+# Progress Logging (clean STEP banners + status lines only)
+# ----------------------------
+
+ProgressLog="/var/log/user-data-progress.log"
+touch "$ProgressLog"
+chmod 644 "$ProgressLog"
+
+TotalSteps=5
+CurrentStep=0
+
+NextStep() {
+  CurrentStep=$((CurrentStep+1))
+  Percent=$((CurrentStep*100/TotalSteps))
+  {
+    echo ""
+    echo "=================================================="
+    echo "STEP $CurrentStep of $TotalSteps  [$Percent%]"
+    echo "$1"
+    echo "=================================================="
+  } | tee -a "$ProgressLog"
+}
+
+LogStatus() {
+  echo "Status: $1" | tee -a "$ProgressLog"
+}
+
+# ----------------------------
+# SSH Watcher: smooth ASCII bar + STEP X/5 + label + spinner (no blinking)
+# Usage after SSH: watchud
+# Auto-exits at STEP 5 with 10s countdown
+# ----------------------------
+
+cat > /usr/local/bin/watch-userdata-progress <<'EOF'
+#!/bin/bash
+set -u
+
+ProgressLog="/var/log/user-data-progress.log"
+TotalBarWidth=24
+RefreshSeconds=0.5
+
+if [ ! -f "$ProgressLog" ]; then
+  echo "Progress log not found: $ProgressLog"
+  exit 1
+fi
+
+# Colors only when output is a real terminal
+if [ -t 1 ]; then
+  C_RESET=$'\033[0m'
+  C_DIM=$'\033[2m'
+  C_BOLD=$'\033[1m'
+  C_CYAN=$'\033[36m'
+  C_YELLOW=$'\033[33m'
+  C_GREEN=$'\033[32m'
+else
+  C_RESET=""
+  C_DIM=""
+  C_BOLD=""
+  C_CYAN=""
+  C_YELLOW=""
+  C_GREEN=""
+fi
+
+Cols=$(tput cols 2>/dev/null || echo 120)
+
+DrawBar() {
+  local Percent="$1"
+  local Filled=$((Percent * TotalBarWidth / 100))
+  local Empty=$((TotalBarWidth - Filled))
+
+  printf "["
+  if [ "$Filled" -gt 0 ]; then
+    printf "%s" "${C_CYAN}"
+    printf "%0.s#" $(seq 1 "$Filled")
+    printf "%s" "${C_RESET}"
+  fi
+  if [ "$Empty" -gt 0 ]; then
+    printf "%s" "${C_DIM}"
+    printf "%0.s-" $(seq 1 "$Empty")
+    printf "%s" "${C_RESET}"
+  fi
+  printf "] %s%%" "$Percent"
+}
+
+GetLatestStepLine() {
+  grep -E "STEP [0-9]+ of [0-9]+  \[[0-9]+%\]" "$ProgressLog" 2>/dev/null | tail -n 1 || true
+}
+
+GetLatestPercent() {
+  local line
+  line="$(GetLatestStepLine)"
+  if [ -n "$line" ]; then
+    echo "$line" | sed -n 's/.*\[\([0-9]\+\)%\].*/\1/p'
+  else
+    echo "0"
+  fi
+}
+
+GetLatestStepNumbers() {
+  local line
+  line="$(GetLatestStepLine)"
+  if [ -n "$line" ]; then
+    echo "$line" | sed -n 's/STEP \([0-9]\+\) of \([0-9]\+\).*/\1 \2/p'
+  else
+    echo "0 0"
+  fi
+}
+
+GetLatestLabel() {
+  awk '/STEP [0-9]+ of [0-9]+  \[[0-9]+%\]/{getline; print}' "$ProgressLog" 2>/dev/null | tail -n 1 || true
+}
+
+RenderLine() {
+  local Percent="$1"
+  local StepNow="$2"
+  local StepTotal="$3"
+  local Label="$4"
+  local Frame="$5"
+
+  local Bar StepText StepPlain
+  Bar="$(DrawBar "$Percent")"
+
+  if [ "${StepTotal:-0}" -gt 0 ]; then
+    StepText="${C_GREEN}STEP ${StepNow}/${StepTotal}${C_RESET}"
+    StepPlain="STEP ${StepNow}/${StepTotal}"
+  else
+    StepText=""
+    StepPlain=""
+  fi
+
+  # Fixed visible width: "Deploying " (9) + bar (~30) + "  " + step + "  " + spinner (1) + padding (4)
+  local FixedLen=$(( 9 + 30 + 2 + ${#StepPlain} + 2 + 1 + 4 ))
+  local MaxLabel=$(( Cols - FixedLen ))
+  [ "$MaxLabel" -lt 8 ] && MaxLabel=8
+  local TruncLabel="${Label:0:$MaxLabel}"
+
+  # \r\033[2K clears the entire current line before redrawing — prevents
+  # ANSI-inflated line width from wrapping and leaving ghost fragments on right
+  printf "\r\033[2K"
+  printf "${C_BOLD}Deploying${C_RESET} %s  %s  ${C_YELLOW}%s${C_RESET}  %s" \
+    "$Bar" "$StepText" "$TruncLabel" "$Frame"
+}
+
+echo ""
+echo "${C_BOLD}Watching EC2 user-data progress${C_RESET} (Ctrl+C to stop)"
+echo ""
+
+# Show some context
+tail -n 20 "$ProgressLog" 2>/dev/null || true
+
+LastLineCount=$(wc -l < "$ProgressLog" 2>/dev/null || echo 0)
+
+TargetPercent="$(GetLatestPercent)"
+ShownPercent="$TargetPercent"
+read -r StepNow StepTotal <<<"$(GetLatestStepNumbers)"
+CurrentLabel="$(GetLatestLabel)"
+[ -z "${CurrentLabel:-}" ] && CurrentLabel="Starting..."
+
+i=0
+frames='|/-\'
+
+while true; do
+  CurrentLineCount=$(wc -l < "$ProgressLog" 2>/dev/null || echo "$LastLineCount")
+
+  # Only print STEP banner lines from newly appended log content.
+  # Suppressing Status: lines and separators prevents them from pushing
+  # the dashboard bar to a new line each refresh cycle (multiline stacking).
+  if [ "$CurrentLineCount" -gt "$LastLineCount" ]; then
+    NewLines=$(sed -n "$((LastLineCount+1)),${CurrentLineCount}p" "$ProgressLog" 2>/dev/null || true)
+    if echo "$NewLines" | grep -qE "^STEP [0-9]+ of [0-9]+"; then
+      printf "\r%-*s\n" "$Cols" " "
+      echo "$NewLines" | grep -E "^(={10,}|STEP [0-9]+ of [0-9]+)" || true
+    fi
+    LastLineCount="$CurrentLineCount"
+  fi
+
+  # Update targets from log
+  NewTarget="$(GetLatestPercent)"
+  [ -n "${NewTarget:-}" ] && TargetPercent="$NewTarget"
+
+  read -r NewStepNow NewStepTotal <<<"$(GetLatestStepNumbers)"
+  [ -n "${NewStepNow:-}" ] && StepNow="$NewStepNow"
+  [ -n "${NewStepTotal:-}" ] && StepTotal="$NewStepTotal"
+
+  NewLabel="$(GetLatestLabel)"
+  [ -n "${NewLabel:-}" ] && CurrentLabel="$NewLabel"
+
+  # Smooth-fill toward the target
+  if [ "$ShownPercent" -lt "$TargetPercent" ]; then
+    ShownPercent=$((ShownPercent+1))
+  elif [ "$ShownPercent" -gt "$TargetPercent" ]; then
+    ShownPercent="$TargetPercent"
+  fi
+
+  # Completion check — STEP 5 of 5
+  if tail -n 50 "$ProgressLog" 2>/dev/null | grep -q "STEP 5 of 5"; then
+    RenderLine 100 5 5 "$CurrentLabel" ""
+    printf "\n\n${C_GREEN}  Bootstrap complete — REPLICA is ready for Phase 2.${C_RESET}\n"
+
+    if [ ! -x /usr/local/bin/replica-setup ]; then
+      printf "${C_RED}  replica-setup command not found. Run: sudo replica-setup${C_RESET}\n"
+      exit 0
+    fi
+
+    printf "\n  ${C_BOLD}Launching replica setup wizard in...${C_RESET}\n"
+    for count in 5 4 3 2 1; do
+      printf "\r    ${C_CYAN}%s${C_RESET} second(s)  (Ctrl+C to skip)  " "$count"
+      sleep 1
+    done
+    printf "\r%-*s\n" "$Cols" " "
+
+    exec sudo /usr/local/bin/replica-setup
+  fi
+
+  frame="${frames:i%4:1}"
+  RenderLine "$ShownPercent" "$StepNow" "$StepTotal" "$CurrentLabel" "$frame"
+
+  i=$((i+1))
+  sleep "$RefreshSeconds"
+done
+EOF
+
+chmod 755 /usr/local/bin/watch-userdata-progress
+
+# ----------------------------
+# Create watchud command
+# ----------------------------
+
+cat > /usr/local/bin/watchud <<'EOF'
+#!/bin/bash
+exec /usr/local/bin/watch-userdata-progress
+EOF
+chmod 755 /usr/local/bin/watchud
+
+if [ -f /home/ubuntu/.bashrc ] && ! grep -q "alias watchud=" /home/ubuntu/.bashrc 2>/dev/null; then
+  echo "" >> /home/ubuntu/.bashrc
+  echo "alias watchud='/usr/local/bin/watchud'" >> /home/ubuntu/.bashrc
+fi
+chown ubuntu:ubuntu /home/ubuntu/.bashrc 2>/dev/null || true
+
+# ----------------------------
+# STEP 1: System prep
+# ----------------------------
+
+NextStep "System preparation and package updates"
+LogStatus "Updating packages (apt update/upgrade)"
+apt update
+apt upgrade -y
+LogStatus "Installing prerequisites (curl, unzip, wget)"
+apt install apt-transport-https curl unzip wget -y
+LogStatus "Prerequisites installed"
+
+# ----------------------------
+# STEP 2: Install MariaDB 11.8
+# ----------------------------
+
+NextStep "Installing MariaDB 11.8"
+LogStatus "Adding MariaDB repo key and sources"
+mkdir -p /etc/apt/keyrings
+curl -o /etc/apt/keyrings/mariadb-keyring.pgp 'https://mariadb.org/mariadb_release_signing_key.pgp'
+
+cat > /etc/apt/sources.list.d/mariadb.sources <<'EOF'
+X-Repolib-Name: MariaDB
+Types: deb
+URIs: https://mirrors.accretive-networks.net/mariadb/repo/11.8/ubuntu
+Suites: noble
+Components: main main/debug
+Signed-By: /etc/apt/keyrings/mariadb-keyring.pgp
+EOF
+
+LogStatus "Installing MariaDB server"
+apt update
+apt install mariadb-server -y
+
+LogStatus "Enabling and starting MariaDB service"
+systemctl enable mariadb
+systemctl start mariadb
+touch /root/3-mariadb-installed
+
+systemctl is-active --quiet mariadb || { echo "ERROR: MariaDB did not start"; exit 1; }
+LogStatus "MariaDB is running"
+
+# ----------------------------
+# STEP 3: Configure MariaDB for REPLICA role
+# ----------------------------
+
+NextStep "Configuring MariaDB as REPLICA (server-id=${SERVER_ID})"
+LogStatus "Locating MariaDB config file"
+
+CNFFILE=""
+for f in /etc/mysql/mariadb.conf.d/50-server.cnf \
+          /etc/mysql/my.cnf \
+          /etc/my.cnf; do
+  [ -f "$f" ] && CNFFILE="$f" && break
+done
+
+if [ -z "$CNFFILE" ]; then
+  echo "ERROR: Could not find MariaDB config file"
+  exit 1
+fi
+
+LogStatus "Applying REPLICA config to $CNFFILE"
+
+# Comment out skip-networking if present
+sed -i 's/^skip-networking/#skip-networking/' "$CNFFILE"
+
+# Set bind-address to 0.0.0.0 (accept connections from within security group)
+if grep -q "^bind-address" "$CNFFILE"; then
+  sed -i 's/^bind-address.*/bind-address = 0.0.0.0/' "$CNFFILE"
+else
+  echo "bind-address = 0.0.0.0" >> "$CNFFILE"
+fi
+
+# Set unique server-id for this replica
+if grep -q "^server-id" "$CNFFILE"; then
+  sed -i "s/^server-id.*/server-id = ${SERVER_ID}/" "$CNFFILE"
+else
+  echo "server-id = ${SERVER_ID}" >> "$CNFFILE"
+fi
+
+# Set read-only: prevents accidental writes to replica
+# NOTE: root/SUPER users bypass this — only effective for unprivileged users
+if ! grep -q "^read_only" "$CNFFILE"; then
+  echo "read_only = 1" >> "$CNFFILE"
+fi
+
+LogStatus "Restarting MariaDB with REPLICA config"
+systemctl restart mariadb
+systemctl is-active --quiet mariadb || { echo "ERROR: MariaDB failed to restart"; exit 1; }
+LogStatus "REPLICA config applied (server-id=${SERVER_ID}, read_only=1)"
+
+# ----------------------------
+# STEP 4: Create Linux user mbennett
+# NOTE: Linux users do NOT replicate via MariaDB replication.
+# This user must be created on each server individually (done here via User Data).
+# The MariaDB-level mbennett user WILL replicate from Primary automatically.
+# ----------------------------
+
+NextStep "Creating unprivileged Linux user (mbennett)"
+LogStatus "Creating Linux user (mbennett)"
+if id "mbennett" &>/dev/null; then
+  echo "Linux user mbennett already exists"
+else
+  useradd -m -s /bin/bash "mbennett"
+  echo "Created Linux user mbennett"
+fi
+LogStatus "Linux user step completed"
+
+# ----------------------------
+# STEP 5: Bootstrap complete
+# ----------------------------
+
+NextStep "Bootstrap complete — installing replica setup wizard"
+
+cat > /usr/local/bin/replica-setup <<'WIZEOF'
+#!/bin/bash
+# =============================================================================
+# REPLICA — Phase 2 Setup Wizard
+# Run after bootstrap completes: sudo replica-setup
+# Launched automatically by watchud on bootstrap completion.
+# =============================================================================
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: Please run as root: sudo replica-setup"
+  exit 1
+fi
+
+set +e
+
+C_RESET=$'\033[0m'
+C_BOLD=$'\033[1m'
+C_GREEN=$'\033[32m'
+C_YELLOW=$'\033[33m'
+C_RED=$'\033[31m'
+C_CYAN=$'\033[36m'
+C_DIM=$'\033[2m'
+
+# ----------------------------
+# IP entry screen
+# ----------------------------
+clear
+echo ""
+printf "${C_BOLD}╔══════════════════════════════════════════════════════════╗${C_RESET}\n"
+printf "${C_BOLD}║      REPLICA (server-id=3) — Setup Wizard              ║${C_RESET}\n"
+printf "${C_BOLD}║      Connect this replica to the Primary                 ║${C_RESET}\n"
+printf "${C_BOLD}╚══════════════════════════════════════════════════════════╝${C_RESET}\n"
+echo ""
+printf "  Enter the PRIMARY private IP address.\n"
+printf "  Find it in the EC2 console or from the Primary watchud screen.\n"
+echo ""
+read -rp "  Primary IP: " PrimaryIP
+
+if [ -z "$PrimaryIP" ]; then
+  printf "${C_RED}  ERROR: No IP entered. Exiting.\n${C_RESET}"
+  exit 1
+fi
+
+echo ""
+printf "  ${C_GREEN}Using Primary IP: %s${C_RESET}\n" "$PrimaryIP"
+sleep 1
+
+# Step flags
+s1=0; s2=0; s3=0
+
+CheckMark() { [ "$1" -eq 1 ] && printf "${C_GREEN}✓${C_RESET}" || printf "${C_DIM}·${C_RESET}"; }
+
+DrawMenu() {
+  clear
+  echo ""
+  printf "${C_BOLD}╔══════════════════════════════════════════════════════════╗${C_RESET}\n"
+  printf "${C_BOLD}║      REPLICA (server-id=3) — Setup Wizard              ║${C_RESET}\n"
+  printf "${C_BOLD}║      Primary IP: %-39s ║${C_RESET}\n" "$PrimaryIP"
+  printf "${C_BOLD}╚══════════════════════════════════════════════════════════╝${C_RESET}\n"
+  echo ""
+  printf "  ${C_CYAN}[1]${C_RESET} $(CheckMark $s1)  Run CHANGE MASTER TO + START SLAVE ${C_DIM}(auto-executes)${C_RESET}\n"
+  printf "  ${C_CYAN}[2]${C_RESET} $(CheckMark $s2)  Verify replication status ${C_DIM}(SHOW SLAVE STATUS)${C_RESET}\n"
+  printf "  ${C_CYAN}[3]${C_RESET} $(CheckMark $s3)  Test read-only constraint ${C_DIM}(mbennett INSERT attempt)${C_RESET}\n"
+  echo ""
+  printf "  ${C_CYAN}[r]${C_RESET}    Refresh menu\n"
+  printf "  ${C_CYAN}[q]${C_RESET}    Quit (return to prompt)\n"
+  echo ""
+}
+
+while true; do
+  DrawMenu
+  read -rp "  Select step: " choice
+
+  case "$choice" in
+
+    1)
+      echo ""
+      printf "${C_BOLD}Running CHANGE MASTER TO and START SLAVE...${C_RESET}\n"
+      mariadb <<SQL
+CHANGE MASTER TO
+  MASTER_HOST='$PrimaryIP',
+  MASTER_USER='repl_user',
+  MASTER_PASSWORD='Repl!Secure#2026',
+  MASTER_PORT=3306,
+  MASTER_CONNECT_RETRY=10;
+SQL
+      if [ $? -eq 0 ]; then
+        mariadb -e "START SLAVE;"
+        printf "${C_GREEN}  CHANGE MASTER TO applied and SLAVE started.${C_RESET}\n"
+        s1=1
+      else
+        printf "${C_RED}  ERROR: CHANGE MASTER TO failed. Check Primary IP and repl_user.\n${C_RESET}"
+      fi
+      read -rp "  Press Enter to continue..." _
+      ;;
+
+    2)
+      echo ""
+      printf "${C_BOLD}Replication status:${C_RESET}\n"
+      mariadb -e "SHOW SLAVE STATUS\G"
+      echo ""
+      printf "${C_DIM}  Look for: Slave_IO_Running: Yes  /  Slave_SQL_Running: Yes${C_RESET}\n"
+      printf "${C_DIM}  If Connecting: check Security Group port 3306 and Primary IP.${C_RESET}\n"
+      s2=1
+      read -rp "  Press Enter to continue..." _
+      ;;
+
+    3)
+      echo ""
+      if [ $s2 -ne 1 ]; then
+        printf "${C_RED}  Verify replication first (step 2).${C_RESET}\n"
+      else
+        printf "${C_BOLD}Testing read-only constraint as mbennett...${C_RESET}\n"
+        echo ""
+        printf "${C_DIM}  Running: mariadb -u mbennett -p'MyVoiceIsMyPassport!' -e \"USE POS; INSERT INTO Orderline ...\"${C_RESET}\n"
+        echo ""
+        mariadb -u mbennett -p'MyVoiceIsMyPassport!' POS -e           "INSERT INTO Orderline (order_id, product_id, quantity) VALUES (9999, 1, 1);" 2>&1 || true
+        echo ""
+        printf "${C_GREEN}  Expected: ERROR 1290 — The MariaDB server is running with the --read-only option${C_RESET}\n"
+        s3=1
+
+        if [ $s3 -eq 1 ]; then
+          echo ""
+          printf "${C_BOLD}${C_GREEN}"
+          printf "  ╔══════════════════════════════════════════════════════╗\n"
+          printf "  ║   Replica setup complete. This node is live.        ║\n"
+          printf "  ║   Replication running + read-only enforced.         ║\n"
+          printf "  ╚══════════════════════════════════════════════════════╝\n"
+          printf "${C_RESET}"
+        fi
+      fi
+      read -rp "  Press Enter to continue..." _
+      ;;
+
+    r|R) ;;
+
+    q|Q)
+      echo ""
+      printf "${C_DIM}  Exiting. Run 'sudo replica-setup' to re-launch at any time.${C_RESET}\n"
+      echo ""
+      exit 0
+      ;;
+
+    *)
+      printf "${C_RED}  Invalid selection.${C_RESET}\n"
+      read -rp "  Press Enter to continue..." _
+      ;;
+
+  esac
+done
+WIZEOF
+
+chmod 755 /usr/local/bin/replica-setup
+touch /root/replica-bootstrap-complete
+LogStatus "Replica bootstrap complete"
+LogStatus "Run 'sudo replica-setup' to connect to Primary"
+
+echo ""
+echo "============================================================"
+echo "  REPLICA (server-id=3) bootstrap complete."
+echo "  When watchud exits, run:  sudo replica-setup"
+echo "============================================================"
