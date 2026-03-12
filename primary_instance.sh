@@ -134,19 +134,28 @@ RenderLine() {
   local Label="$4"
   local Frame="$5"
 
-  local Bar StepText Text
+  local Bar StepText StepPlain
   Bar="$(DrawBar "$Percent")"
 
   if [ "${StepTotal:-0}" -gt 0 ]; then
     StepText="${C_GREEN}STEP ${StepNow}/${StepTotal}${C_RESET}"
+    StepPlain="STEP ${StepNow}/${StepTotal}"
   else
     StepText=""
+    StepPlain=""
   fi
 
-  Text="${C_BOLD}Deploying${C_RESET} ${Bar}  ${StepText}  ${C_YELLOW}${Label}${C_RESET}  ${Frame}"
+  # Fixed visible width: "Deploying " (9) + bar (~30) + "  " + step + "  " + spinner (1) + padding (4)
+  local FixedLen=$(( 9 + 30 + 2 + ${#StepPlain} + 2 + 1 + 4 ))
+  local MaxLabel=$(( Cols - FixedLen ))
+  [ "$MaxLabel" -lt 8 ] && MaxLabel=8
+  local TruncLabel="${Label:0:$MaxLabel}"
 
-  # Print one line, padded to terminal width to overwrite previous content (no flicker)
-  printf "\r%-*s" "$Cols" "$Text"
+  # \r\033[2K clears the entire current line before redrawing — prevents
+  # ANSI-inflated line width from wrapping and leaving ghost fragments on right
+  printf "\r\033[2K"
+  printf "${C_BOLD}Deploying${C_RESET} %s  %s  ${C_YELLOW}%s${C_RESET}  %s" \
+    "$Bar" "$StepText" "$TruncLabel" "$Frame"
 }
 
 echo ""
@@ -203,14 +212,23 @@ while true; do
   # Completion check — STEP 8 of 8
   if tail -n 50 "$ProgressLog" 2>/dev/null | grep -q "STEP 8 of 8"; then
     RenderLine 100 8 8 "$CurrentLabel" ""
-    printf "\n\n${C_GREEN}Bootstrap complete — PRIMARY is ready for Phase 2.${C_RESET}\nReturning to prompt in 10 seconds...\n"
-    for count in 10 9 8 7 6 5 4 3 2 1; do
-      printf "\r  Closing in %s second(s)...  " "$count"
+    printf "\n\n${C_GREEN}  Bootstrap complete — PRIMARY is ready for Phase 2.${C_RESET}\n"
+
+    # Check if phase2 wizard is available
+    if [ ! -x /usr/local/bin/phase2 ]; then
+      printf "${C_RED}  phase2 command not found. Run: sudo phase2${C_RESET}\n"
+      exit 0
+    fi
+
+    printf "\n  ${C_BOLD}Launching Phase 2 wizard in...${C_RESET}\n"
+    for count in 5 4 3 2 1; do
+      printf "\r    ${C_CYAN}%s${C_RESET} second(s)  (Ctrl+C to skip)  " "$count"
       sleep 1
     done
     printf "\r%-*s\n" "$Cols" " "
-    echo "Done."
-    exit 0
+
+    # Hand off to phase2 — exec replaces this process cleanly
+    exec sudo /usr/local/bin/phase2
   fi
 
   frame="${frames:i%4:1}"
@@ -667,6 +685,7 @@ cat > /usr/local/bin/phase2 <<'WIZEOF'
 # =============================================================================
 # PRIMARY — Phase 2 Setup Wizard
 # Run after bootstrap completes: sudo phase2
+# Launched automatically by watchud on bootstrap completion.
 # =============================================================================
 
 # Must run as root to execute MariaDB commands and SQL files
@@ -678,10 +697,6 @@ fi
 set +e
 
 DbPass="MyVoiceIsMyPassport!"
-PrimaryIP=$(hostname -I | awk '{print $1}')
-
-# Step completion flags
-s1=0; s2=0; s3=0; s4=0; s5=0; s6=0; s7=0
 
 # Colors
 C_RESET=$'\033[0m'
@@ -691,6 +706,38 @@ C_YELLOW=$'\033[33m'
 C_RED=$'\033[31m'
 C_CYAN=$'\033[36m'
 C_DIM=$'\033[2m'
+
+# ----------------------------
+# IP Confirmation Screen
+# Auto-detects Private IP, lets user confirm or override before menu loads
+# ----------------------------
+clear
+echo ""
+printf "${C_BOLD}╔══════════════════════════════════════════════════════════╗${C_RESET}\n"
+printf "${C_BOLD}║         PRIMARY — Phase 2 Setup Wizard                  ║${C_RESET}\n"
+printf "${C_BOLD}║         IP Confirmation                                 ║${C_RESET}\n"
+printf "${C_BOLD}╚══════════════════════════════════════════════════════════╝${C_RESET}\n"
+echo ""
+DetectedIP=$(hostname -I | awk '{print $1}')
+printf "  ${C_DIM}Detected Private IP:${C_RESET} ${C_CYAN}%s${C_RESET}\n" "$DetectedIP"
+echo ""
+printf "  This IP will be inserted into the CHANGE MASTER TO\n"
+printf "  template shown on step 2. Confirm it is correct.\n"
+echo ""
+read -rp "  Press Enter to accept [$DetectedIP] or type a different IP: " InputIP
+
+if [ -z "$InputIP" ]; then
+  PrimaryIP="$DetectedIP"
+else
+  PrimaryIP="$InputIP"
+fi
+
+echo ""
+printf "  ${C_GREEN}Using Primary IP: %s${C_RESET}\n" "$PrimaryIP"
+sleep 1
+
+# Step completion flags
+s1=0; s2=0; s3=0; s4=0; s5=0; s6=0; s7=0
 
 CheckMark() { [ "$1" -eq 1 ] && printf "${C_GREEN}✓${C_RESET}" || printf "${C_DIM}·${C_RESET}"; }
 
