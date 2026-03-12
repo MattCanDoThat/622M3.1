@@ -657,226 +657,239 @@ chown "mbennett:mbennett" "/home/mbennett/triggers.sql"
 LogStatus "triggers.sql generated"
 
 # ----------------------------
-# STEP 8: Bootstrap complete — launch Phase 2 wizard
+# STEP 8: Bootstrap complete — install phase2 wizard as standalone command
 # ----------------------------
 
-NextStep "Bootstrap complete — launching Phase 2 setup wizard"
-touch /root/primary-bootstrap-complete
-LogStatus "Primary bootstrap complete - entering Phase 2 wizard"
+NextStep "Bootstrap complete — installing Phase 2 wizard"
 
-# ----------------------------
-# Phase 2 Interactive Wizard
-# Disable set -e for the wizard — interactive prompts and SQL commands
-# may return non-zero without being fatal errors.
-# ----------------------------
+cat > /usr/local/bin/phase2 <<'WIZEOF'
+#!/bin/bash
+# =============================================================================
+# PRIMARY — Phase 2 Setup Wizard
+# Run after bootstrap completes: sudo phase2
+# =============================================================================
+
+# Must run as root to execute MariaDB commands and SQL files
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: Please run as root: sudo phase2"
+  exit 1
+fi
 
 set +e
 
-Phase2Wizard() {
-  local DbPass="MyVoiceIsMyPassport!"
-  local PrimaryIP
-  PrimaryIP=$(hostname -I | awk '{print $1}')
+DbPass="MyVoiceIsMyPassport!"
+PrimaryIP=$(hostname -I | awk '{print $1}')
 
-  # Step completion flags
-  local s1=0 s2=0 s3=0 s4=0 s5=0 s6=0 s7=0
+# Step completion flags
+s1=0; s2=0; s3=0; s4=0; s5=0; s6=0; s7=0
 
-  # Colors
-  local C_RESET=$'\033[0m'
-  local C_BOLD=$'\033[1m'
-  local C_GREEN=$'\033[32m'
-  local C_YELLOW=$'\033[33m'
-  local C_RED=$'\033[31m'
-  local C_CYAN=$'\033[36m'
-  local C_DIM=$'\033[2m'
+# Colors
+C_RESET=$'\033[0m'
+C_BOLD=$'\033[1m'
+C_GREEN=$'\033[32m'
+C_YELLOW=$'\033[33m'
+C_RED=$'\033[31m'
+C_CYAN=$'\033[36m'
+C_DIM=$'\033[2m'
 
-  CheckMark() { [ "$1" -eq 1 ] && printf "${C_GREEN}✓${C_RESET}" || printf "${C_DIM} ${C_RESET}"; }
+CheckMark() { [ "$1" -eq 1 ] && printf "${C_GREEN}✓${C_RESET}" || printf "${C_DIM}·${C_RESET}"; }
 
-  DrawMenu() {
-    clear
-    echo ""
-    printf "${C_BOLD}╔══════════════════════════════════════════════════════════╗${C_RESET}\n"
-    printf "${C_BOLD}║         PRIMARY — Phase 2 Setup Wizard                  ║${C_RESET}\n"
-    printf "${C_BOLD}║         Primary IP: %-36s ║${C_RESET}\n" "$PrimaryIP"
-    printf "${C_BOLD}╚══════════════════════════════════════════════════════════╝${C_RESET}\n"
-    echo ""
-    printf "  ${C_CYAN}[1]${C_RESET} $(CheckMark $s1)  Create replication user ${C_DIM}(auto-executes SQL)${C_RESET}\n"
-    printf "  ${C_CYAN}[2]${C_RESET} $(CheckMark $s2)  Show Primary IP + CHANGE MASTER TO template\n"
-    printf "  ${C_CYAN}[3]${C_RESET} $(CheckMark $s3)  Confirm both replicas are connected ${C_DIM}(manual check)${C_RESET}\n"
-    printf "  ${C_CYAN}[4]${C_RESET} $(CheckMark $s4)  Verify binary log ${C_DIM}(SHOW MASTER STATUS)${C_RESET}\n"
-    printf "  ${C_CYAN}[5]${C_RESET} $(CheckMark $s5)  ${C_YELLOW}Execute etl.sql${C_RESET} ${C_DIM}(auto-executes — requires step 3)${C_RESET}\n"
-    printf "  ${C_CYAN}[6]${C_RESET} $(CheckMark $s6)  Create mbennett DB user + grant privileges ${C_DIM}(requires step 5)${C_RESET}\n"
-    printf "  ${C_CYAN}[7]${C_RESET} $(CheckMark $s7)  ${C_YELLOW}Execute views.sql + triggers.sql${C_RESET} ${C_DIM}(requires step 6)${C_RESET}\n"
-    echo ""
-    printf "  ${C_CYAN}[r]${C_RESET}    Refresh menu\n"
-    printf "  ${C_CYAN}[q]${C_RESET}    Quit wizard (return to prompt)\n"
-    echo ""
-  }
+DrawMenu() {
+  clear
+  echo ""
+  printf "${C_BOLD}╔══════════════════════════════════════════════════════════╗${C_RESET}\n"
+  printf "${C_BOLD}║         PRIMARY — Phase 2 Setup Wizard                  ║${C_RESET}\n"
+  printf "${C_BOLD}║         Primary IP: %-36s ║${C_RESET}\n" "$PrimaryIP"
+  printf "${C_BOLD}╚══════════════════════════════════════════════════════════╝${C_RESET}\n"
+  echo ""
+  printf "  ${C_CYAN}[1]${C_RESET} $(CheckMark $s1)  Create replication user ${C_DIM}(auto-executes SQL)${C_RESET}\n"
+  printf "  ${C_CYAN}[2]${C_RESET} $(CheckMark $s2)  Show CHANGE MASTER TO template for replicas\n"
+  printf "  ${C_CYAN}[3]${C_RESET} $(CheckMark $s3)  Confirm both replicas connected ${C_DIM}(manual verification)${C_RESET}\n"
+  printf "  ${C_CYAN}[4]${C_RESET} $(CheckMark $s4)  Verify binary log ${C_DIM}(SHOW MASTER STATUS)${C_RESET}\n"
+  printf "  ${C_CYAN}[5]${C_RESET} $(CheckMark $s5)  ${C_YELLOW}Execute etl.sql${C_RESET} ${C_DIM}(requires step 3)${C_RESET}\n"
+  printf "  ${C_CYAN}[6]${C_RESET} $(CheckMark $s6)  Create mbennett DB user + grant privileges ${C_DIM}(requires step 5)${C_RESET}\n"
+  printf "  ${C_CYAN}[7]${C_RESET} $(CheckMark $s7)  ${C_YELLOW}Execute views.sql + triggers.sql${C_RESET} ${C_DIM}(requires step 6)${C_RESET}\n"
+  echo ""
+  printf "  ${C_CYAN}[r]${C_RESET}    Refresh menu\n"
+  printf "  ${C_CYAN}[q]${C_RESET}    Quit (return to prompt)\n"
+  echo ""
+}
 
-  while true; do
-    DrawMenu
-    read -rp "  Select step: " choice
+while true; do
+  DrawMenu
+  read -rp "  Select step: " choice
 
-    case "$choice" in
+  case "$choice" in
 
-      1)
-        echo ""
-        printf "${C_BOLD}Creating replication user...${C_RESET}\n"
-        mariadb <<'SQL'
+    1)
+      echo ""
+      printf "${C_BOLD}Creating replication user...${C_RESET}\n"
+      mariadb <<'SQL'
 CREATE USER IF NOT EXISTS 'repl_user'@'%' IDENTIFIED BY 'Repl!Secure#2026';
 GRANT REPLICATION SLAVE ON *.* TO 'repl_user'@'%';
 FLUSH PRIVILEGES;
 SQL
+      if [ $? -eq 0 ]; then
+        printf "${C_GREEN}  repl_user created successfully.${C_RESET}\n"
+        s1=1
+      else
+        printf "${C_RED}  ERROR: Failed. Check: sudo tail -50 /var/log/mysql/error.log${C_RESET}\n"
+      fi
+      read -rp "  Press Enter to continue..." _
+      ;;
+
+    2)
+      echo ""
+      printf "${C_BOLD}Run these commands on EACH REPLICA (as root):${C_RESET}\n"
+      echo ""
+      printf "${C_YELLOW}mariadb <<'SQL'\n"
+      printf "CHANGE MASTER TO\n"
+      printf "  MASTER_HOST='%s',\n" "$PrimaryIP"
+      printf "  MASTER_USER='repl_user',\n"
+      printf "  MASTER_PASSWORD='Repl!Secure#2026',\n"
+      printf "  MASTER_PORT=3306,\n"
+      printf "  MASTER_CONNECT_RETRY=10;\n"
+      printf "SQL\n\n"
+      printf "mariadb -e \"START SLAVE;\"\n"
+      printf "mariadb -e \"SHOW SLAVE STATUS\\\\G\"\n"
+      printf "${C_RESET}"
+      echo ""
+      printf "${C_DIM}  Tip: Type the single quotes manually — do not copy from PDF/Word.${C_RESET}\n"
+      s2=1
+      read -rp "  Press Enter to continue..." _
+      ;;
+
+    3)
+      echo ""
+      printf "${C_BOLD}Replica verification checklist:${C_RESET}\n"
+      printf "  On each replica, confirm SHOW SLAVE STATUS\\G shows:\n"
+      printf "    ${C_GREEN}Slave_IO_Running: Yes${C_RESET}\n"
+      printf "    ${C_GREEN}Slave_SQL_Running: Yes${C_RESET}\n"
+      printf "    ${C_GREEN}Seconds_Behind_Master: 0${C_RESET}\n"
+      echo ""
+      read -rp "  Are BOTH replicas showing Yes/Yes? (y/n): " confirm
+      if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        printf "${C_GREEN}  Confirmed. Safe to proceed to ETL.${C_RESET}\n"
+        s3=1
+      else
+        printf "${C_RED}  Not confirmed. Fix replicas before running ETL.${C_RESET}\n"
+      fi
+      read -rp "  Press Enter to continue..." _
+      ;;
+
+    4)
+      echo ""
+      printf "${C_BOLD}Primary binary log status:${C_RESET}\n"
+      mariadb -e "SHOW MASTER STATUS\G"
+      s4=1
+      read -rp "  Press Enter to continue..." _
+      ;;
+
+    5)
+      echo ""
+      if [ $s3 -ne 1 ]; then
+        printf "${C_RED}  BLOCKED: Confirm replicas are connected first (step 3).${C_RESET}\n"
+        printf "  Running ETL before replicas connect means they will miss\n"
+        printf "  the data load entirely and replication will crash.\n"
+      else
+        printf "${C_BOLD}Running etl.sql (this may take a minute)...${C_RESET}\n"
+        mariadb --local-infile=1 < /home/mbennett/etl.sql
         if [ $? -eq 0 ]; then
-          printf "${C_GREEN}  Replication user 'repl_user' created successfully.${C_RESET}\n"
-          s1=1
+          printf "${C_GREEN}  ETL complete. POS database built and data loaded.${C_RESET}\n"
+          s5=1
         else
-          printf "${C_RED}  ERROR: Failed to create replication user. Check MariaDB logs.${C_RESET}\n"
+          printf "${C_RED}  ERROR: ETL failed. Check /var/log/user-data.log${C_RESET}\n"
         fi
-        read -rp "  Press Enter to continue..." _
-        ;;
+      fi
+      read -rp "  Press Enter to continue..." _
+      ;;
 
-      2)
-        echo ""
-        printf "${C_BOLD}Run these commands on EACH REPLICA:${C_RESET}\n"
-        echo ""
-        printf "${C_YELLOW}  mariadb <<'SQL'\n"
-        printf "  CHANGE MASTER TO\n"
-        printf "    MASTER_HOST='${PrimaryIP}',\n"
-        printf "    MASTER_USER='repl_user',\n"
-        printf "    MASTER_PASSWORD='Repl!Secure#2026',\n"
-        printf "    MASTER_PORT=3306,\n"
-        printf "    MASTER_CONNECT_RETRY=10;\n"
-        printf "  SQL\n\n"
-        printf "  mariadb -e \"START SLAVE;\"\n"
-        printf "  mariadb -e \"SHOW SLAVE STATUS\\\\G\"${C_RESET}\n"
-        echo ""
-        printf "${C_DIM}  Note: Use straight single quotes when typing in terminal.${C_RESET}\n"
-        s2=1
-        read -rp "  Press Enter to continue..." _
-        ;;
-
-      3)
-        echo ""
-        printf "${C_BOLD}Replica connection check:${C_RESET}\n"
-        printf "  SSH into each replica and verify:\n"
-        printf "    ${C_GREEN}Slave_IO_Running: Yes${C_RESET}\n"
-        printf "    ${C_GREEN}Slave_SQL_Running: Yes${C_RESET}\n"
-        printf "    ${C_GREEN}Seconds_Behind_Master: 0${C_RESET}\n"
-        echo ""
-        read -rp "  Are BOTH replicas showing Yes/Yes? (y/n): " confirm
-        if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-          printf "${C_GREEN}  Confirmed. Replicas are connected.${C_RESET}\n"
-          s3=1
-        else
-          printf "${C_RED}  Not confirmed. Complete replica setup before proceeding to step 5.${C_RESET}\n"
-        fi
-        read -rp "  Press Enter to continue..." _
-        ;;
-
-      4)
-        echo ""
-        printf "${C_BOLD}Binary log status:${C_RESET}\n"
-        mariadb -e "SHOW MASTER STATUS\G"
-        s4=1
-        read -rp "  Press Enter to continue..." _
-        ;;
-
-      5)
-        echo ""
-        if [ $s3 -ne 1 ]; then
-          printf "${C_RED}  WARNING: Complete step 3 first.${C_RESET}\n"
-          printf "  Replicas must be connected before ETL — otherwise they will miss\n"
-          printf "  the initial data load and replication will crash.\n"
-        else
-          printf "${C_BOLD}Running etl.sql...${C_RESET}\n"
-          mariadb --local-infile=1 < /home/mbennett/etl.sql
-          if [ $? -eq 0 ]; then
-            printf "${C_GREEN}  ETL complete. POS database built and loaded.${C_RESET}\n"
-            s5=1
-          else
-            printf "${C_RED}  ERROR: ETL failed. Check /var/log/user-data.log for details.${C_RESET}\n"
-          fi
-        fi
-        read -rp "  Press Enter to continue..." _
-        ;;
-
-      6)
-        echo ""
-        if [ $s5 -ne 1 ]; then
-          printf "${C_RED}  WARNING: Run ETL first (step 5).${C_RESET}\n"
-          printf "  POS database must exist before granting privileges.\n"
-        else
-          printf "${C_BOLD}Creating mbennett DB user and granting privileges...${C_RESET}\n"
-          mariadb <<SQL
+    6)
+      echo ""
+      if [ $s5 -ne 1 ]; then
+        printf "${C_RED}  BLOCKED: Run ETL first (step 5) — POS database must exist.${C_RESET}\n"
+      else
+        printf "${C_BOLD}Creating mbennett MariaDB user...${C_RESET}\n"
+        mariadb <<SQL
 CREATE USER IF NOT EXISTS 'mbennett'@'localhost' IDENTIFIED BY '${DbPass}';
 GRANT ALL PRIVILEGES ON POS.* TO 'mbennett'@'localhost';
 FLUSH PRIVILEGES;
 SQL
-          if [ $? -eq 0 ]; then
-            printf "${C_GREEN}  mbennett DB user created. Privileges granted on POS.*.${C_RESET}\n"
-            printf "${C_DIM}  Note: This replicates to both replicas automatically.${C_RESET}\n"
-            s6=1
-          else
-            printf "${C_RED}  ERROR: Failed to create DB user.${C_RESET}\n"
-          fi
-        fi
-        read -rp "  Press Enter to continue..." _
-        ;;
-
-      7)
-        echo ""
-        if [ $s6 -ne 1 ]; then
-          printf "${C_RED}  WARNING: Complete step 6 first.${C_RESET}\n"
+        if [ $? -eq 0 ]; then
+          printf "${C_GREEN}  mbennett created and granted POS.* privileges.${C_RESET}\n"
+          printf "${C_DIM}  This SQL-level user replicates to both replicas automatically.${C_RESET}\n"
+          s6=1
         else
-          printf "${C_BOLD}Running views.sql...${C_RESET}\n"
-          mariadb < /home/mbennett/views.sql
-          if [ $? -eq 0 ]; then
-            printf "${C_GREEN}  views.sql complete (view + materialized view + index).${C_RESET}\n"
-          else
-            printf "${C_RED}  ERROR: views.sql failed.${C_RESET}\n"
-          fi
-
-          echo ""
-          printf "${C_BOLD}Running triggers.sql...${C_RESET}\n"
-          mariadb < /home/mbennett/triggers.sql
-          if [ $? -eq 0 ]; then
-            printf "${C_GREEN}  triggers.sql complete (3 triggers created).${C_RESET}\n"
-            s7=1
-          else
-            printf "${C_RED}  ERROR: triggers.sql failed.${C_RESET}\n"
-          fi
-
-          if [ $s7 -eq 1 ]; then
-            echo ""
-            printf "${C_BOLD}${C_GREEN}"
-            printf "  ╔══════════════════════════════════════════════════════╗\n"
-            printf "  ║   All Phase 2 steps complete. Cluster is live.      ║\n"
-            printf "  ║   Run validation checks from Validation_Checks_M2   ║\n"
-            printf "  ╚══════════════════════════════════════════════════════╝\n"
-            printf "${C_RESET}"
-          fi
+          printf "${C_RED}  ERROR: Failed to create DB user.${C_RESET}\n"
         fi
-        read -rp "  Press Enter to continue..." _
-        ;;
+      fi
+      read -rp "  Press Enter to continue..." _
+      ;;
 
-      r|R)
-        # Just redraws the menu on next loop iteration
-        ;;
+    7)
+      echo ""
+      if [ $s6 -ne 1 ]; then
+        printf "${C_RED}  BLOCKED: Complete step 6 first.${C_RESET}\n"
+      else
+        printf "${C_BOLD}Running views.sql...${C_RESET}\n"
+        mariadb < /home/mbennett/views.sql
+        if [ $? -eq 0 ]; then
+          printf "${C_GREEN}  views.sql complete (view + materialized view + index).${C_RESET}\n"
+        else
+          printf "${C_RED}  ERROR: views.sql failed.${C_RESET}\n"
+        fi
 
-      q|Q)
         echo ""
-        printf "${C_DIM}  Exiting Phase 2 wizard. Type 'watchud' to review progress log.${C_RESET}\n"
-        echo ""
-        break
-        ;;
+        printf "${C_BOLD}Running triggers.sql...${C_RESET}\n"
+        mariadb < /home/mbennett/triggers.sql
+        if [ $? -eq 0 ]; then
+          printf "${C_GREEN}  triggers.sql complete (3 triggers created).${C_RESET}\n"
+          s7=1
+        else
+          printf "${C_RED}  ERROR: triggers.sql failed.${C_RESET}\n"
+        fi
 
-      *)
-        printf "${C_RED}  Invalid selection. Choose 1-7, r, or q.${C_RESET}\n"
-        read -rp "  Press Enter to continue..." _
-        ;;
+        if [ $s7 -eq 1 ]; then
+          echo ""
+          printf "${C_BOLD}${C_GREEN}"
+          printf "  ╔══════════════════════════════════════════════════════╗\n"
+          printf "  ║   All Phase 2 steps complete. Cluster is live.      ║\n"
+          printf "  ║   Run: mariadb -u mbennett -p                       ║\n"
+          printf "  ║   Then: USE POS; SHOW TABLES;                       ║\n"
+          printf "  ╚══════════════════════════════════════════════════════╝\n"
+          printf "${C_RESET}"
+        fi
+      fi
+      read -rp "  Press Enter to continue..." _
+      ;;
 
-    esac
-  done
-}
+    r|R)
+      ;;
 
-Phase2Wizard
+    q|Q)
+      echo ""
+      printf "${C_DIM}  Exiting wizard. Run 'sudo phase2' to re-launch at any time.${C_RESET}\n"
+      echo ""
+      exit 0
+      ;;
+
+    *)
+      printf "${C_RED}  Invalid selection. Choose 1-7, r, or q.${C_RESET}\n"
+      read -rp "  Press Enter to continue..." _
+      ;;
+
+  esac
+done
+WIZEOF
+
+chmod 755 /usr/local/bin/phase2
+
+touch /root/primary-bootstrap-complete
+LogStatus "Primary bootstrap complete"
+LogStatus "Run 'sudo phase2' to begin replication setup"
+
+echo ""
+echo "============================================================"
+echo "  PRIMARY bootstrap complete."
+echo "  When watchud exits, run:  sudo phase2"
+echo "============================================================"
