@@ -714,15 +714,15 @@ C_DIM=$'\033[2m'
 clear
 echo ""
 printf "${C_BOLD}╔══════════════════════════════════════════════════════════╗${C_RESET}\n"
-printf "${C_BOLD}║         PRIMARY — Phase 2 Setup Wizard                  ║${C_RESET}\n"
-printf "${C_BOLD}║         IP Confirmation                                 ║${C_RESET}\n"
+printf "${C_BOLD}║         PRIMARY — Phase 2 Setup Wizard                   ║${C_RESET}\n"
+printf "${C_BOLD}║         IP Confirmation                                  ║${C_RESET}\n"
 printf "${C_BOLD}╚══════════════════════════════════════════════════════════╝${C_RESET}\n"
 echo ""
 DetectedIP=$(hostname -I | awk '{print $1}')
 printf "  ${C_DIM}Detected Private IP:${C_RESET} ${C_CYAN}%s${C_RESET}\n" "$DetectedIP"
 echo ""
-printf "  This IP will be inserted into the CHANGE MASTER TO\n"
-printf "  template shown on step 2. Confirm it is correct.\n"
+printf "  This IP will be shown in the wizard for reference.\n"
+printf "  Replicas will prompt for it separately in replica-setup.\n"
 echo ""
 read -rp "  Press Enter to accept [$DetectedIP] or type a different IP: " InputIP
 
@@ -737,25 +737,24 @@ printf "  ${C_GREEN}Using Primary IP: %s${C_RESET}\n" "$PrimaryIP"
 sleep 1
 
 # Step completion flags
-s1=0; s2=0; s3=0; s4=0; s5=0; s6=0; s7=0
+s1=0; s2=0; s3=0; s4=0; s5=0; s6=0
 
 CheckMark() { [ "$1" -eq 1 ] && printf "${C_GREEN}✓${C_RESET}" || printf "${C_DIM}·${C_RESET}"; }
 
 DrawMenu() {
   clear
   echo ""
-  printf "${C_BOLD}╔══════════════════════════════════════════════════════════╗${C_RESET}\n"
-  printf "${C_BOLD}║         PRIMARY — Phase 2 Setup Wizard                  ║${C_RESET}\n"
-  printf "${C_BOLD}║         Primary IP: %-36s ║${C_RESET}\n" "$PrimaryIP"
-  printf "${C_BOLD}╚══════════════════════════════════════════════════════════╝${C_RESET}\n"
+  printf "${C_BOLD}╔════════════════════════════════════════════════════════════╗${C_RESET}\n"
+  printf "${C_BOLD}║          PRIMARY — Phase 2 Setup Wizard                    ║${C_RESET}\n"
+  printf "${C_BOLD}║          Primary IP: %-37s                                 ║${C_RESET}\n" "$PrimaryIP"
+  printf "${C_BOLD}╚════════════════════════════════════════════════════════════╝${C_RESET}\n"
   echo ""
   printf "  ${C_CYAN}[1]${C_RESET} $(CheckMark $s1)  Create replication user ${C_DIM}(auto-executes SQL)${C_RESET}\n"
-  printf "  ${C_CYAN}[2]${C_RESET} $(CheckMark $s2)  Show CHANGE MASTER TO template for replicas\n"
+  printf "  ${C_CYAN}[2]${C_RESET} $(CheckMark $s2)  Verify binary log ${C_DIM}(SHOW MASTER STATUS)${C_RESET}\n"
   printf "  ${C_CYAN}[3]${C_RESET} $(CheckMark $s3)  Confirm both replicas connected ${C_DIM}(manual verification)${C_RESET}\n"
-  printf "  ${C_CYAN}[4]${C_RESET} $(CheckMark $s4)  Verify binary log ${C_DIM}(SHOW MASTER STATUS)${C_RESET}\n"
-  printf "  ${C_CYAN}[5]${C_RESET} $(CheckMark $s5)  ${C_YELLOW}Execute etl.sql${C_RESET} ${C_DIM}(requires step 3)${C_RESET}\n"
-  printf "  ${C_CYAN}[6]${C_RESET} $(CheckMark $s6)  Create mbennett DB user + grant privileges ${C_DIM}(requires step 5)${C_RESET}\n"
-  printf "  ${C_CYAN}[7]${C_RESET} $(CheckMark $s7)  ${C_YELLOW}Execute views.sql + triggers.sql${C_RESET} ${C_DIM}(requires step 6)${C_RESET}\n"
+  printf "  ${C_CYAN}[4]${C_RESET} $(CheckMark $s4)  ${C_YELLOW}Execute etl.sql${C_RESET} ${C_DIM}(requires step 3)${C_RESET}\n"
+  printf "  ${C_CYAN}[5]${C_RESET} $(CheckMark $s5)  Create mbennett DB user + grant privileges ${C_DIM}(requires step 4)${C_RESET}\n"
+  printf "  ${C_CYAN}[6]${C_RESET} $(CheckMark $s6)  ${C_YELLOW}Execute views.sql + triggers.sql${C_RESET} ${C_DIM}(requires step 5)${C_RESET}\n"
   echo ""
   printf "  ${C_CYAN}[r]${C_RESET}    Refresh menu\n"
   printf "  ${C_CYAN}[q]${C_RESET}    Quit (return to prompt)\n"
@@ -787,21 +786,8 @@ SQL
 
     2)
       echo ""
-      printf "${C_BOLD}Run these commands on EACH REPLICA (as root):${C_RESET}\n"
-      echo ""
-      printf "${C_YELLOW}mariadb <<'SQL'\n"
-      printf "CHANGE MASTER TO\n"
-      printf "  MASTER_HOST='%s',\n" "$PrimaryIP"
-      printf "  MASTER_USER='repl_user',\n"
-      printf "  MASTER_PASSWORD='Repl!Secure#2026',\n"
-      printf "  MASTER_PORT=3306,\n"
-      printf "  MASTER_CONNECT_RETRY=10;\n"
-      printf "SQL\n\n"
-      printf "mariadb -e \"START SLAVE;\"\n"
-      printf "mariadb -e \"SHOW SLAVE STATUS\\\\G\"\n"
-      printf "${C_RESET}"
-      echo ""
-      printf "${C_DIM}  Tip: Type the single quotes manually — do not copy from PDF/Word.${C_RESET}\n"
+      printf "${C_BOLD}Primary binary log status:${C_RESET}\n"
+      mariadb -e "SHOW MASTER STATUS\G"
       s2=1
       read -rp "  Press Enter to continue..." _
       ;;
@@ -813,6 +799,7 @@ SQL
       printf "    ${C_GREEN}Slave_IO_Running: Yes${C_RESET}\n"
       printf "    ${C_GREEN}Slave_SQL_Running: Yes${C_RESET}\n"
       printf "    ${C_GREEN}Seconds_Behind_Master: 0${C_RESET}\n"
+      printf "  ${C_DIM}  Run replica-setup on each replica if not done yet.${C_RESET}\n"
       echo ""
       read -rp "  Are BOTH replicas showing Yes/Yes? (y/n): " confirm
       if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
@@ -826,14 +813,6 @@ SQL
 
     4)
       echo ""
-      printf "${C_BOLD}Primary binary log status:${C_RESET}\n"
-      mariadb -e "SHOW MASTER STATUS\G"
-      s4=1
-      read -rp "  Press Enter to continue..." _
-      ;;
-
-    5)
-      echo ""
       if [ $s3 -ne 1 ]; then
         printf "${C_RED}  BLOCKED: Confirm replicas are connected first (step 3).${C_RESET}\n"
         printf "  Running ETL before replicas connect means they will miss\n"
@@ -843,7 +822,7 @@ SQL
         mariadb --local-infile=1 < /home/mbennett/etl.sql
         if [ $? -eq 0 ]; then
           printf "${C_GREEN}  ETL complete. POS database built and data loaded.${C_RESET}\n"
-          s5=1
+          s4=1
         else
           printf "${C_RED}  ERROR: ETL failed. Check /var/log/user-data.log${C_RESET}\n"
         fi
@@ -851,10 +830,10 @@ SQL
       read -rp "  Press Enter to continue..." _
       ;;
 
-    6)
+    5)
       echo ""
-      if [ $s5 -ne 1 ]; then
-        printf "${C_RED}  BLOCKED: Run ETL first (step 5) — POS database must exist.${C_RESET}\n"
+      if [ $s4 -ne 1 ]; then
+        printf "${C_RED}  BLOCKED: Run ETL first (step 4) — POS database must exist.${C_RESET}\n"
       else
         printf "${C_BOLD}Creating mbennett MariaDB user...${C_RESET}\n"
         mariadb <<SQL
@@ -865,7 +844,7 @@ SQL
         if [ $? -eq 0 ]; then
           printf "${C_GREEN}  mbennett created and granted POS.* privileges.${C_RESET}\n"
           printf "${C_DIM}  This SQL-level user replicates to both replicas automatically.${C_RESET}\n"
-          s6=1
+          s5=1
         else
           printf "${C_RED}  ERROR: Failed to create DB user.${C_RESET}\n"
         fi
@@ -873,10 +852,10 @@ SQL
       read -rp "  Press Enter to continue..." _
       ;;
 
-    7)
+    6)
       echo ""
-      if [ $s6 -ne 1 ]; then
-        printf "${C_RED}  BLOCKED: Complete step 6 first.${C_RESET}\n"
+      if [ $s5 -ne 1 ]; then
+        printf "${C_RED}  BLOCKED: Complete step 5 first.${C_RESET}\n"
       else
         printf "${C_BOLD}Running views.sql...${C_RESET}\n"
         mariadb < /home/mbennett/views.sql
@@ -891,18 +870,18 @@ SQL
         mariadb < /home/mbennett/triggers.sql
         if [ $? -eq 0 ]; then
           printf "${C_GREEN}  triggers.sql complete (3 triggers created).${C_RESET}\n"
-          s7=1
+          s6=1
         else
           printf "${C_RED}  ERROR: triggers.sql failed.${C_RESET}\n"
         fi
 
-        if [ $s7 -eq 1 ]; then
+        if [ $s6 -eq 1 ]; then
           echo ""
           printf "${C_BOLD}${C_GREEN}"
           printf "  ╔══════════════════════════════════════════════════════╗\n"
-          printf "  ║   All Phase 2 steps complete. Cluster is live.      ║\n"
-          printf "  ║   Run: mariadb -u mbennett -p                       ║\n"
-          printf "  ║   Then: USE POS; SHOW TABLES;                       ║\n"
+          printf "  ║   All Phase 2 steps complete. Cluster is live.       ║\n"
+          printf "  ║   Run: mariadb -u mbennett -p                        ║\n"
+          printf "  ║   Then: USE POS; SHOW TABLES;                        ║\n"
           printf "  ╚══════════════════════════════════════════════════════╝\n"
           printf "${C_RESET}"
         fi
