@@ -405,7 +405,7 @@ C_DIM=$'\033[2m'
 clear
 echo ""
 printf "${C_BOLD}╔══════════════════════════════════════════════════════════╗${C_RESET}\n"
-printf "${C_BOLD}║      REPLICA (server-id=3) — Setup Wizard              ║${C_RESET}\n"
+printf "${C_BOLD}║      REPLICA (server-id=3) — Setup Wizard                ║${C_RESET}\n"
 printf "${C_BOLD}║      Connect this replica to the Primary                 ║${C_RESET}\n"
 printf "${C_BOLD}╚══════════════════════════════════════════════════════════╝${C_RESET}\n"
 echo ""
@@ -432,7 +432,7 @@ DrawMenu() {
   clear
   echo ""
   printf "${C_BOLD}╔══════════════════════════════════════════════════════════╗${C_RESET}\n"
-  printf "${C_BOLD}║      REPLICA (server-id=3) — Setup Wizard              ║${C_RESET}\n"
+  printf "${C_BOLD}║      REPLICA (server-id=3) — Setup Wizard                ║${C_RESET}\n"
   printf "${C_BOLD}║      Primary IP: %-39s ║${C_RESET}\n" "$PrimaryIP"
   printf "${C_BOLD}╚══════════════════════════════════════════════════════════╝${C_RESET}\n"
   echo ""
@@ -501,8 +501,8 @@ SQL
           echo ""
           printf "${C_BOLD}${C_GREEN}"
           printf "  ╔══════════════════════════════════════════════════════╗\n"
-          printf "  ║   Replica setup complete. This node is live.        ║\n"
-          printf "  ║   Replication running + read-only enforced.         ║\n"
+          printf "  ║   Replica setup complete. This node is live.         ║\n"
+          printf "  ║   Replication running + read-only enforced.          ║\n"
           printf "  ╚══════════════════════════════════════════════════════╝\n"
           printf "${C_RESET}"
         fi
