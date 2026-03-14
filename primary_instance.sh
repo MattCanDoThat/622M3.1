@@ -746,7 +746,7 @@ DrawMenu() {
   echo ""
   printf "${C_BOLD}╔════════════════════════════════════════════════════════════╗${C_RESET}\n"
   printf "${C_BOLD}║          PRIMARY — Phase 2 Setup Wizard                    ║${C_RESET}\n"
-  printf "${C_BOLD}║          Primary IP: %-37s                                 ║${C_RESET}\n" "$PrimaryIP"
+  printf "${C_BOLD}║          Primary IP: "$PrimaryIP"                          ║${C_RESET}\n" 
   printf "${C_BOLD}╚════════════════════════════════════════════════════════════╝${C_RESET}\n"
   echo ""
   printf "  ${C_CYAN}[1]${C_RESET} $(CheckMark $s1)  Create replication user ${C_DIM}(auto-executes SQL)${C_RESET}\n"
